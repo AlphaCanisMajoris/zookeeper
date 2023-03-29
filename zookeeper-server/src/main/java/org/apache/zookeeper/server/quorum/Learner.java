@@ -746,7 +746,6 @@ public class Learner {
                         zk.takeSnapshot(syncSnapshot);
                     }
 
-                    self.setCurrentEpoch(newEpoch);
                     writeToTxnLog = true;
                     //Anything after this needs to go to the transaction log, not applied directly in memory
                     isPreZAB1_0 = false;
@@ -764,6 +763,9 @@ public class Learner {
                         // persist the transaction logs
                         fzk.getZKDatabase().commit();
                     }
+
+                    // ZOOKEEPER-4643: make sure to update currentEpoch only after the transaction logs are synced
+                    self.setCurrentEpoch(newEpoch);
 
                     writePacket(new QuorumPacket(Leader.ACK, newLeaderZxid, null, null), true);
                     break;
