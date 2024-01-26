@@ -556,7 +556,8 @@ public class Learner {
         readPacket(qp);
         Deque<Long> packetsCommitted = new ArrayDeque<>();
         Deque<PacketInFlight> packetsNotCommitted = new ArrayDeque<>();
-        Deque<Request> requestsToBeReplied = new ArrayDeque<>();
+        Deque<Request> requestsToAck = new ArrayDeque<>();
+
         synchronized (zk) {
             if (qp.getType() == Leader.DIFF) {
                 LOG.info("Getting a diff from the leader 0x{}", Long.toHexString(qp.getZxid()));
@@ -746,28 +747,37 @@ public class Learner {
                         zk.takeSnapshot(syncSnapshot);
                     }
 
+
                     writeToTxnLog = true;
                     //Anything after this needs to go to the transaction log, not applied directly in memory
                     isPreZAB1_0 = false;
 
-                    // ZOOKEEPER-3911 & 4646: make sure sync the uncommitted logs before commit them (ACK NEWLEADER).
+                    // ZOOKEEPER-3911: make sure sync the uncommitted logs before commit them (ACK NEWLEADER).
                     sock.setSoTimeout(self.tickTime * self.syncLimit);
                     self.setSyncMode(QuorumPeer.SyncMode.NONE);
                     zk.startupWithoutServing();
                     if (zk instanceof FollowerZooKeeperServer) {
+                        long startTime = Time.currentElapsedTime();
                         FollowerZooKeeperServer fzk = (FollowerZooKeeperServer) zk;
                         for (PacketInFlight p : packetsNotCommitted) {
-                            requestsToBeReplied.add(fzk.logRequestBeforeAckNewleader(p.hdr, p.rec, p.digest));
+                            final Request request = fzk.appendRequest(p.hdr, p.rec, p.digest);
+                            requestsToAck.add(request);
                         }
-                        packetsNotCommitted.clear();
-                        // persist the transaction logs
+
+                        // persist the txns to disk
                         fzk.getZKDatabase().commit();
+                        LOG.info("{} txns have been persisted and it took {}ms",
+                        packetsNotCommitted.size(), Time.currentElapsedTime() - startTime);
+                        packetsNotCommitted.clear();
                     }
 
-                    // ZOOKEEPER-4643: make sure to update currentEpoch only after the transaction logs are synced
+                    // set the current epoch after all the tnxs are persisted
                     self.setCurrentEpoch(newEpoch);
+                    LOG.info("Set the current epoch to {}", newEpoch);
 
+                    // send NEWLEADER ack after all the tnxs are persisted
                     writePacket(new QuorumPacket(Leader.ACK, newLeaderZxid, null, null), true);
+                    LOG.info("Sent NEWLEADER ack to leader with zxid {}", Long.toHexString(newLeaderZxid));
                     break;
                 }
             }
@@ -786,23 +796,25 @@ public class Learner {
 
         // We need to log the stuff that came in between the snapshot and the uptodate
         if (zk instanceof FollowerZooKeeperServer) {
-            // Reply queued ACKs that are generated before replying ACK of NEWLEADER
-            // ZOOKEEPER-4685: make sure to reply ACK of PROPOSAL after replying ACK of NEWLEADER.
-            for (Request si : requestsToBeReplied) {
-                QuorumPacket p = new QuorumPacket(Leader.ACK, si.getHdr().getZxid(), null, null);
-                si.logLatency(ServerMetrics.getMetrics().PROPOSAL_ACK_CREATION_LATENCY);
-                writePacket(p, false);
+            // reply ACK of PROPOSAL after ACK of NEWLEADER to avoid leader shutdown due to timeout
+            // on waiting for a quorum of followers
+            for (final Request request : requestsToAck) {
+                final QuorumPacket ackPacket = new QuorumPacket(Leader.ACK, request.getHdr().getZxid(), null, null);
+                writePacket(ackPacket, false);
             }
-            requestsToBeReplied.clear();
             writePacket(null, true);
+            requestsToAck.clear();
 
             FollowerZooKeeperServer fzk = (FollowerZooKeeperServer) zk;
             for (PacketInFlight p : packetsNotCommitted) {
                 fzk.logRequest(p.hdr, p.rec, p.digest);
             }
+            LOG.info("{} txns have been logged asynchronously", packetsNotCommitted.size());
+
             for (Long zxid : packetsCommitted) {
                 fzk.commit(zxid);
             }
+            LOG.info("{} txns have been committed", packetsCommitted.size());
         } else if (zk instanceof ObserverZooKeeperServer) {
             // Similar to follower, we need to log requests between the snapshot
             // and UPTODATE
